@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { ErrorInfo } from 'react';
-import { render } from 'ink';
+import React, { ErrorInfo, useState, useEffect } from 'react';
+import { render, Box, Text } from 'ink';
+import Spinner from 'ink-spinner';
 import { AppWrapper } from './ui/App.js';
 import { ErrorBoundary } from './ui/components/ErrorBoundary.js';
 import { loadCliConfig, parseArguments } from './config/config.js';
@@ -32,6 +33,7 @@ import {
   getOauthClient,
   setGitStatsService,
   FatalConfigError,
+  uiTelemetryService,
   // IDE connection logging removed - telemetry disabled in llxprt
 } from '@vybestack/llxprt-code-core';
 import { themeManager } from './ui/themes/theme-manager.js';
@@ -40,7 +42,11 @@ import { getUserStartupWarnings } from './utils/userStartupWarnings.js';
 import { ConsolePatcher } from './ui/utils/ConsolePatcher.js';
 import { runNonInteractive } from './nonInteractiveCli.js';
 import { loadExtensions } from './config/extension.js';
-import { cleanupCheckpoints, registerCleanup } from './utils/cleanup.js';
+import {
+  cleanupCheckpoints,
+  registerCleanup,
+  runExitCleanup,
+} from './utils/cleanup.js';
 import { getCliVersion } from './utils/version.js';
 import { validateAuthMethod } from './config/auth.js';
 import { setMaxSizedBoxDebugging } from './ui/components/shared/MaxSizedBox.js';
@@ -56,6 +62,7 @@ import { handleAutoUpdate } from './utils/handleAutoUpdate.js';
 import { GitStatsServiceImpl } from './providers/logging/git-stats-service-impl.js';
 import { appEvents, AppEvent } from './utils/events.js';
 import { SettingsContext } from './ui/contexts/SettingsContext.js';
+import { writeFileSync } from 'node:fs';
 
 export function validateDnsResolutionOrder(
   order: string | undefined,
@@ -117,6 +124,39 @@ async function relaunchWithAdditionalArgs(additionalArgs: string[]) {
   await new Promise((resolve) => child.on('close', resolve));
   process.exit(0);
 }
+
+const InitializingComponent = ({ initialTotal }: { initialTotal: number }) => {
+  const [total, setTotal] = useState(initialTotal);
+  const [connected, setConnected] = useState(0);
+
+  useEffect(() => {
+    const onStart = ({ count }: { count: number }) => setTotal(count);
+    const onChange = () => {
+      setConnected((val) => val + 1);
+    };
+
+    appEvents.on('mcp-servers-discovery-start', onStart);
+    appEvents.on('mcp-server-connected', onChange);
+    appEvents.on('mcp-server-error', onChange);
+
+    return () => {
+      appEvents.off('mcp-servers-discovery-start', onStart);
+      appEvents.off('mcp-server-connected', onChange);
+      appEvents.off('mcp-server-error', onChange);
+    };
+  }, []);
+
+  const message = `Connecting to MCP servers... (${connected}/${total})`;
+
+  return (
+    <Box>
+      <Text>
+        <Spinner /> {message}
+      </Text>
+    </Box>
+  );
+};
+
 import { runZedIntegration } from './zed-integration/zedIntegration.js';
 import { existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
@@ -252,6 +292,16 @@ export async function main() {
     argv,
   );
 
+  if (argv.sessionSummary) {
+    registerCleanup(() => {
+      const metrics = uiTelemetryService.getMetrics();
+      writeFileSync(
+        argv.sessionSummary!,
+        JSON.stringify({ sessionMetrics: metrics }, null, 2),
+      );
+    });
+  }
+
   const consolePatcher = new ConsolePatcher({
     stderr: true,
     debugMode: config.getDebugMode(),
@@ -313,18 +363,31 @@ export async function main() {
       );
     }
   }
-  // Empty key causes issues with the GoogleGenAI package.
-  if (process.env['GEMINI_API_KEY']?.trim() === '') {
-    delete process.env['GEMINI_API_KEY'];
-  }
-
-  if (process.env['GOOGLE_API_KEY']?.trim() === '') {
-    delete process.env['GOOGLE_API_KEY'];
-  }
 
   setMaxSizedBoxDebugging(config.getDebugMode());
 
+  const mcpServers = config.getMcpServers();
+  const mcpServersCount = mcpServers ? Object.keys(mcpServers).length : 0;
+
+  let spinnerInstance;
+  if (
+    typeof config.isInteractive === 'function' &&
+    config.isInteractive() &&
+    mcpServersCount > 0
+  ) {
+    spinnerInstance = render(
+      <InitializingComponent initialTotal={mcpServersCount} />,
+    );
+  }
+
   await config.initialize();
+
+  if (spinnerInstance) {
+    // Small UX detail to show the completion message for a bit before unmounting.
+    await new Promise((f) => setTimeout(f, 100));
+    spinnerInstance.clear();
+    spinnerInstance.unmount();
+  }
 
   if (config.getIdeMode()) {
     const ideClient = config.getIdeClient();
@@ -709,7 +772,7 @@ export async function main() {
   providerManager.getActiveProvider();
 
   // Render UI, passing necessary config values. Check that there is no command line question.
-  if (config.isInteractive()) {
+  if (typeof config.isInteractive === 'function' && config.isInteractive()) {
     await startInteractiveUI(config, settings, startupWarnings, workspaceRoot);
     return;
   }
@@ -737,6 +800,8 @@ export async function main() {
   );
 
   await runNonInteractive(nonInteractiveConfig, input, prompt_id);
+  // Call cleanup before process.exit, which causes cleanup to not run
+  await runExitCleanup();
   process.exit(0);
 }
 
