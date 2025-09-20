@@ -10,6 +10,26 @@ import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import fs from 'fs';
 
+// Plugin to remove duplicate createRequire imports
+const createRequirePlugin = {
+  name: 'createRequire-plugin',
+  setup(build) {
+    build.onLoad(
+      { filter: /node_modules\/fdir\/dist\/index\.mjs$/ },
+      async (args) => {
+        const contents = await fs.promises.readFile(args.path, 'utf8');
+        // Remove duplicate createRequire import - it's already in the banner
+        let transformed = contents.replace(
+          'import { createRequire } from "module";',
+          '// createRequire imported from banner',
+        );
+
+        return { contents: transformed, loader: 'js' };
+      },
+    );
+  },
+};
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
@@ -24,6 +44,7 @@ esbuild
     outfile: 'bundle/llxprt.js',
     platform: 'node',
     format: 'esm',
+    plugins: [createRequirePlugin],
     external: [
       '@lydell/node-pty',
       'node-pty',
